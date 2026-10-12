@@ -47,11 +47,11 @@ without a valid name/header are ignored by the indexer.
 
 ## Tools (`scriptbox` namespace)
 
-- `list` — compact catalog (name + purpose). Check here before
-  ad-hoc heredocs.
+- `save {filename, content}` — validate and store a script in one
+  step. Rejects bad names/headers before touching disk.
+- `list` — compact catalog (name + purpose) from a live disk scan.
+  Check here before ad-hoc heredocs.
 - `show {name}` — usage, path, last-used of one script.
-- `register {path}` — validate a file inside the registry dir and
-  index it immediately (otherwise indexed at next session start).
 
 A `tool.execute.before` hook observes shell invocations referencing
 registry scripts and bumps their `lastUsed`, feeding pruning. It never

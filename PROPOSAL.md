@@ -27,8 +27,8 @@ fallbacks), drifting, untested, and burning tokens.
 
 - No execution runner: shell already runs scripts with full
   auditability. A runner adds surface without value.
-- No directory sniffing: closed-world indexing only. Privacy
-  requires that unregistered files never enter context.
+- No directory sniffing: closed-world scanning only. Privacy
+  requires that unindexed files never enter context.
 - No per-script output-dir env vars: placement is decided at
   invocation (`--out` flags), not by registry policy.
 
@@ -45,6 +45,6 @@ fallbacks), drifting, untested, and burning tokens.
 
 ## Evidence
 
-Working prototype: this plugin (`scriptbox/list|show|register`),
+Working prototype: this plugin (`scriptbox/save|list|show`),
 published on npm, loaded in live sessions. Unit tests cover the
 header contract and closed-world indexing.

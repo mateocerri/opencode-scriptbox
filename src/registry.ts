@@ -1,11 +1,17 @@
 /**
- * Index derived from scanning the registry directory.
+ * Live-scan registry: the catalog is derived from disk on every call.
  *
- * Source of truth is the headers on disk: every scan rebuilds the
- * catalog from files with valid names and headers. `index.json` is a
- * cache that additionally preserves `lastUsed` across rebuilds.
+ * There is no index file to drift out of sync. Usage stats live in
+ * `usage.json`, maintained solely by the plugin — never a manual step.
  */
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { parseHeader, validateFileName } from "./header.ts";
 
@@ -14,91 +20,134 @@ export interface Entry {
   usage: string | null;
   path: string;
   updatedAt: string;
-  lastUsed: string | null;
 }
 
-export interface IndexFile {
-  version: 1;
+export interface ScanResult {
   scripts: Record<string, Entry>;
+  /** Files skipped: bad name, bad header, unreadable, not a file. */
+  ignored: number;
 }
 
-export const INDEX_NAME = "index.json";
+export const USAGE_NAME = "usage.json";
 
-export function emptyIndex(): IndexFile {
-  return { version: 1, scripts: {} };
+interface UsageFile {
+  version: 1;
+  used: Record<string, string>;
 }
 
-export function loadIndex(dir: string): IndexFile | null {
-  try {
-    const raw = readFileSync(join(dir, INDEX_NAME), "utf8");
-    const parsed = JSON.parse(raw) as IndexFile;
-    if (parsed?.version !== 1 || typeof parsed.scripts !== "object") return null;
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-export function saveIndex(dir: string, index: IndexFile): void {
-  writeFileSync(join(dir, INDEX_NAME), JSON.stringify(index, null, 2) + "\n", "utf8");
-}
-
-/** Rebuild the catalog from disk, preserving lastUsed from prev. */
-export function buildIndex(dir: string, prev: IndexFile | null): IndexFile {
-  const next = emptyIndex();
+/** Derive the catalog from files on disk. Invalid files stay invisible. */
+export function scan(dir: string): ScanResult {
+  const result: ScanResult = { scripts: {}, ignored: 0 };
   let names: string[];
   try {
     names = readdirSync(dir);
   } catch {
-    return next;
+    return result;
   }
   for (const base of names) {
-    if (base === INDEX_NAME) continue;
-    if (validateFileName(base) !== null) continue;
+    if (base === USAGE_NAME) continue;
+    if (validateFileName(base) !== null) {
+      result.ignored++;
+      continue;
+    }
     const path = join(dir, base);
     try {
-      if (!statSync(path).isFile()) continue;
+      if (!statSync(path).isFile()) {
+        result.ignored++;
+        continue;
+      }
       const parsed = parseHeader(readFileSync(path, "utf8"));
-      if ("error" in parsed) continue;
+      if ("error" in parsed) {
+        result.ignored++;
+        continue;
+      }
       const name = base.replace(/\.(py|sh)$/, "");
-      next.scripts[name] = {
+      result.scripts[name] = {
         description: parsed.header.purpose,
         usage: parsed.header.usage,
         path,
         updatedAt: statSync(path).mtime.toISOString(),
-        lastUsed: prev?.scripts[name]?.lastUsed ?? null,
       };
     } catch {
-      continue;
+      result.ignored++;
     }
   }
-  return next;
+  return result;
 }
 
-export function touchUsed(dir: string, name: string): boolean {
-  const prev = loadIndex(dir);
-  if (!prev?.scripts[name]) return false;
-  prev.scripts[name].lastUsed = new Date().toISOString();
+/**
+ * Validate and store a script. Atomic write (temp + rename) so a crash
+ * never leaves a half-written file in the registry.
+ */
+export function saveScript(
+  dir: string,
+  filename: string,
+  content: string,
+): { name: string; purpose: string } | { error: string } {
+  const badName = validateFileName(filename);
+  if (badName) return { error: badName };
+  const parsed = parseHeader(content);
+  if ("error" in parsed) return { error: parsed.error };
   try {
-    saveIndex(dir, prev);
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, `.${filename}.${process.pid}.tmp`);
+    writeFileSync(tmp, content, "utf8");
+    renameSync(tmp, join(dir, filename));
+  } catch (err) {
+    return { error: `cannot write ${filename}: ${String(err)}` };
+  }
+  return { name: filename.replace(/\.(py|sh)$/, ""), purpose: parsed.header.purpose };
+}
+
+function loadUsage(dir: string): UsageFile {
+  try {
+    const parsed = JSON.parse(readFileSync(join(dir, USAGE_NAME), "utf8")) as UsageFile;
+    if (parsed?.version !== 1 || typeof parsed.used !== "object") throw new Error("bad");
+    return parsed;
+  } catch {
+    return { version: 1, used: {} };
+  }
+}
+
+/** Best-effort usage stamp. Never throws. */
+export function recordUse(dir: string, name: string): boolean {
+  try {
+    const usage = loadUsage(dir);
+    usage.used[name] = new Date().toISOString();
+    writeFileSync(join(dir, USAGE_NAME), JSON.stringify(usage, null, 2) + "\n", "utf8");
     return true;
   } catch {
     return false;
   }
 }
 
-export function formatCatalog(index: IndexFile): string {
-  const names = Object.keys(index.scripts).sort();
-  if (names.length === 0) {
-    return "scriptbox: registry empty — no indexed scripts.";
+export function lastUsed(dir: string, name: string): string | null {
+  try {
+    return loadUsage(dir).used[name] ?? null;
+  } catch {
+    return null;
   }
-  return names.map((n) => `${n} — ${index.scripts[n].description}`).join("\n");
 }
 
-/** Find a registered script name referenced inside a shell command. */
-export function matchInvocation(command: string, dir: string, index: IndexFile): string | null {
+export function formatCatalog(scanResult: ScanResult, dir: string): string {
+  const names = Object.keys(scanResult.scripts).sort();
+  if (names.length === 0) {
+    return "scriptbox: registry empty — save a script, then reuse it by name.";
+  }
+  const lines = names.map((n) => {
+    const used = lastUsed(dir, n);
+    return `${n} — ${scanResult.scripts[n].description}${used ? ` (last used ${used})` : ""}`;
+  });
+  if (scanResult.ignored > 0) {
+    lines.push(`(${scanResult.ignored} file(s) ignored: bad name or header)`);
+  }
+  return lines.join("\n");
+}
+
+/** Find an indexed script name referenced inside a shell command. */
+export function matchInvocation(command: string, dir: string, names: string[]): string | null {
   if (!command.includes(dir)) return null;
-  for (const name of Object.keys(index.scripts)) {
+  for (const name of names) {
     if (command.includes(`${name}.py`) || command.includes(`${name}.sh`)) return name;
   }
   return null;
