@@ -9,7 +9,8 @@ import {
   matchInvocation,
   recordUse,
   saveScript,
-  scan,
+  scanDir,
+  scanRoots,
 } from "../src/registry.ts";
 
 let dir: string;
@@ -21,20 +22,38 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const GOOD_PY = `"""purpose: Compare screenshots.\nusage: python3 png-compare.py A B\n"""\n`;
 const NO_HEADER = `import sys\nprint(sys.argv)\n`;
 
-describe("scan", () => {
+describe("scanDir/scanRoots", () => {
   it("indexes valid scripts, ignores the rest (closed world)", () => {
     writeFileSync(join(dir, "png-compare.py"), GOOD_PY);
     writeFileSync(join(dir, "scratch.py"), NO_HEADER);
     writeFileSync(join(dir, "tmp-1.py"), GOOD_PY);
     writeFileSync(join(dir, "notes.txt"), GOOD_PY);
-    const result = scan(dir);
+    const result = scanDir(dir, "user");
     assert.deepEqual(Object.keys(result.scripts), ["png-compare"]);
     assert.equal(result.scripts["png-compare"].description, "Compare screenshots.");
+    assert.equal(result.scripts["png-compare"].origin, "user");
     assert.equal(result.ignored, 3);
   });
+  it("project root shadows user on collision, origin marked", () => {
+    const proj = mkdtempSync(join(tmpdir(), "scriptbox-proj-"));
+    try {
+      writeFileSync(join(dir, "dup.py"), GOOD_PY);
+      writeFileSync(join(proj, "dup.py"), `"""purpose: Project override.\n"""\n`);
+      const merged = scanRoots([
+        { dir, origin: "user" },
+        { dir: proj, origin: "project" },
+      ]);
+      assert.equal(merged.scripts["dup"].description, "Project override.");
+      assert.equal(merged.scripts["dup"].origin, "project");
+      const cat = formatCatalog(merged, dir);
+      assert.ok(cat.includes("dup [project] — Project override."));
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+    }
+  });
   it("empty or missing dir scans clean", () => {
-    assert.deepEqual(Object.keys(scan(dir).scripts), []);
-    assert.deepEqual(Object.keys(scan(join(dir, "nope")).scripts), []);
+    assert.deepEqual(Object.keys(scanDir(dir, "user").scripts), []);
+    assert.deepEqual(Object.keys(scanDir(join(dir, "nope"), "project").scripts), []);
   });
 });
 
@@ -53,28 +72,31 @@ describe("saveScript", () => {
     const r = saveScript(dir, "png-compare.py", GOOD_PY);
     assert.ok(!("error" in r));
     assert.equal(readFileSync(join(dir, "png-compare.py"), "utf8"), GOOD_PY);
-    assert.deepEqual(Object.keys(scan(dir).scripts), ["png-compare"]);
+    assert.deepEqual(Object.keys(scanDir(dir, "user").scripts), ["png-compare"]);
   });
 });
 
 describe("recordUse + matchInvocation", () => {
-  it("stamps usage only for indexed scripts referenced with dir", () => {
+  it("stamps usage by absolute path, only for indexed scripts", () => {
     writeFileSync(join(dir, "png-compare.py"), GOOD_PY);
-    const names = Object.keys(scan(dir).scripts);
-    assert.equal(matchInvocation(`python3 ${dir}/png-compare.py a b`, dir, names), "png-compare");
-    assert.equal(matchInvocation("python3 /elsewhere/png-compare.py a", dir, names), null);
-    assert.equal(matchInvocation("ls -la", dir, names), null);
-    assert.equal(lastUsed(dir, "png-compare"), null);
-    assert.equal(recordUse(dir, "png-compare"), true);
-    assert.ok(lastUsed(dir, "png-compare"));
+    const catalog = scanRoots([{ dir, origin: "user" }]);
+    const hit = matchInvocation(`python3 ${dir}/png-compare.py a b`, catalog);
+    assert.equal(hit?.name, "png-compare");
+    assert.equal(matchInvocation("python3 /elsewhere/png-compare.py a", catalog), null);
+    assert.equal(matchInvocation("ls -la", catalog), null);
+    assert.equal(lastUsed(dir, hit!.entry, "png-compare"), null);
+    assert.equal(recordUse(dir, hit!.entry, "png-compare"), true);
+    assert.ok(lastUsed(dir, hit!.entry, "png-compare"));
   });
 });
 
 describe("formatCatalog", () => {
   it("renders one line per script, empty state otherwise", () => {
     writeFileSync(join(dir, "png-compare.py"), GOOD_PY);
-    const cat = formatCatalog(scan(dir), dir);
+    const cat = formatCatalog(scanRoots([{ dir, origin: "user" }]), dir);
     assert.ok(cat.includes("png-compare — Compare screenshots."));
-    assert.ok(formatCatalog(scan(mkdtempSync(join(tmpdir(), "sb-empty-"))), dir).includes("empty"));
+    assert.ok(
+      formatCatalog(scanRoots([{ dir: mkdtempSync(join(tmpdir(), "sb-empty-")), origin: "user" }]), dir).includes("empty"),
+    );
   });
 });

@@ -1,8 +1,12 @@
 /**
  * Live-scan registry: the catalog is derived from disk on every call.
  *
- * There is no index file to drift out of sync. Usage stats live in
- * `usage.json`, maintained solely by the plugin — never a manual step.
+ * Roots: the user registry always, plus a per-project overlay resolved
+ * from the server working directory — `<cwd>/.opencode/scripts` by
+ * default, `<cwd>/scripts` only behind `scanWorkdirScripts` (a bare
+ * scripts/ dir in a third-party repo can otherwise inject purpose lines
+ * into every session). No index file to drift; usage stats live in the
+ * user dir `usage.json`, maintained solely by the plugin.
  */
 import {
   mkdirSync,
@@ -15,11 +19,19 @@ import {
 import { join } from "node:path";
 import { parseHeader, validateFileName } from "./header.ts";
 
+export type Origin = "user" | "project";
+
 export interface Entry {
   description: string;
   usage: string | null;
   path: string;
   updatedAt: string;
+  origin: Origin;
+}
+
+export interface Root {
+  dir: string;
+  origin: Origin;
 }
 
 export interface ScanResult {
@@ -35,8 +47,8 @@ interface UsageFile {
   used: Record<string, string>;
 }
 
-/** Derive the catalog from files on disk. Invalid files stay invisible. */
-export function scan(dir: string): ScanResult {
+/** Scan one directory; invalid files stay invisible (closed world). */
+export function scanDir(dir: string, origin: Origin): ScanResult {
   const result: ScanResult = { scripts: {}, ignored: 0 };
   let names: string[];
   try {
@@ -67,12 +79,27 @@ export function scan(dir: string): ScanResult {
         usage: parsed.header.usage,
         path,
         updatedAt: statSync(path).mtime.toISOString(),
+        origin,
       };
     } catch {
       result.ignored++;
     }
   }
   return result;
+}
+
+/**
+ * Merge roots in order; later roots win on name collision (project
+ * shadows user: more specific context wins).
+ */
+export function scanRoots(roots: Root[]): ScanResult {
+  const merged: ScanResult = { scripts: {}, ignored: 0 };
+  for (const root of roots) {
+    const r = scanDir(root.dir, root.origin);
+    Object.assign(merged.scripts, r.scripts);
+    merged.ignored += r.ignored;
+  }
+  return merged;
 }
 
 /**
@@ -99,9 +126,9 @@ export function saveScript(
   return { name: filename.replace(/\.(py|sh)$/, ""), purpose: parsed.header.purpose };
 }
 
-function loadUsage(dir: string): UsageFile {
+function loadUsage(userDir: string): UsageFile {
   try {
-    const parsed = JSON.parse(readFileSync(join(dir, USAGE_NAME), "utf8")) as UsageFile;
+    const parsed = JSON.parse(readFileSync(join(userDir, USAGE_NAME), "utf8")) as UsageFile;
     if (parsed?.version !== 1 || typeof parsed.used !== "object") throw new Error("bad");
     return parsed;
   } catch {
@@ -109,46 +136,58 @@ function loadUsage(dir: string): UsageFile {
   }
 }
 
+function usageKey(entry: Entry, name: string): string {
+  return `${entry.origin}:${name}`;
+}
+
 /** Best-effort usage stamp. Never throws. */
-export function recordUse(dir: string, name: string): boolean {
+export function recordUse(userDir: string, entry: Entry, name: string): boolean {
   try {
-    const usage = loadUsage(dir);
-    usage.used[name] = new Date().toISOString();
-    writeFileSync(join(dir, USAGE_NAME), JSON.stringify(usage, null, 2) + "\n", "utf8");
+    const usage = loadUsage(userDir);
+    usage.used[usageKey(entry, name)] = new Date().toISOString();
+    writeFileSync(join(userDir, USAGE_NAME), JSON.stringify(usage, null, 2) + "\n", "utf8");
     return true;
   } catch {
     return false;
   }
 }
 
-export function lastUsed(dir: string, name: string): string | null {
+export function lastUsed(userDir: string, entry: Entry, name: string): string | null {
   try {
-    return loadUsage(dir).used[name] ?? null;
+    return loadUsage(userDir).used[usageKey(entry, name)] ?? null;
   } catch {
     return null;
   }
 }
 
-export function formatCatalog(scanResult: ScanResult, dir: string): string {
-  const names = Object.keys(scanResult.scripts).sort();
+export function formatCatalog(result: ScanResult, userDir: string): string {
+  const names = Object.keys(result.scripts).sort();
   if (names.length === 0) {
     return "scriptbox: registry empty — save a script, then reuse it by name.";
   }
   const lines = names.map((n) => {
-    const used = lastUsed(dir, n);
-    return `${n} — ${scanResult.scripts[n].description}${used ? ` (last used ${used})` : ""}`;
+    const e = result.scripts[n];
+    const used = lastUsed(userDir, e, n);
+    const tag = e.origin === "project" ? " [project]" : "";
+    return `${n}${tag} — ${e.description}${used ? ` (last used ${used})` : ""}`;
   });
-  if (scanResult.ignored > 0) {
-    lines.push(`(${scanResult.ignored} file(s) ignored: bad name or header)`);
+  if (result.ignored > 0) {
+    lines.push(`(${result.ignored} file(s) ignored: bad name or header)`);
   }
   return lines.join("\n");
 }
 
 /** Find an indexed script name referenced inside a shell command. */
-export function matchInvocation(command: string, dir: string, names: string[]): string | null {
-  if (!command.includes(dir)) return null;
-  for (const name of names) {
-    if (command.includes(`${name}.py`) || command.includes(`${name}.sh`)) return name;
+export function matchInvocation(
+  command: string,
+  catalog: ScanResult,
+): { entry: Entry; name: string } | null {
+  for (const name of Object.keys(catalog.scripts)) {
+    const e = catalog.scripts[name];
+    if (!command.includes(e.path)) continue;
+    if (command.includes(`${name}.py`) || command.includes(`${name}.sh`)) {
+      return { entry: e, name };
+    }
   }
   return null;
 }
