@@ -1,6 +1,6 @@
 {
   "name": "opencode-scriptbox",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Closed-world registry of reusable agent utility scripts for OpenCode: descriptive names plus one-line purpose headers, listed on demand.",
   "type": "module",
   "license": "MIT",
