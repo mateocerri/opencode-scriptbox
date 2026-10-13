@@ -45,8 +45,12 @@ pruning. It never blocks or alters a call.
 { "package": "opencode-scriptbox@0.1.0", "options": {} }
 ```
 
-The one option is `{ "dir": "/custom/registry/dir" }`; the default home is
-`~/.config/opencode/scripts`.
+Two options exist: `{ "dir": "/custom/registry/dir" }` (the default home
+is `~/.config/opencode/scripts`) and `{ "metrics": true }`, which keeps
+session-aggregated counters — save, list and show calls, per-script uses
+and shell matches — in the registry's `usage.json`, capped at twenty
+sessions with cumulative totals. Only counts, never commands or contents,
+and it defaults to off.
 
 ## Development
 

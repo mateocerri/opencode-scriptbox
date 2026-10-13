@@ -15,6 +15,7 @@ import {
   formatCatalog,
   lastUsed,
   matchInvocation,
+  recordToolCall,
   recordUse,
   saveScript,
   scanRoots,
@@ -26,6 +27,12 @@ interface ScriptboxOptions {
   dir?: string;
   /** Also scan <workdir>/scripts (bare). Default false — see registry.ts. */
   scanWorkdirScripts?: boolean;
+  /**
+   * Session-aggregated counters (tool calls, per-script uses, shell
+   * matches). Local-only in usage.json, default off. `metrics:"verbose"`
+   * is reserved for future per-operation debugging.
+   */
+  metrics?: boolean | "verbose";
 }
 
 function resolveRoots(opts: ScriptboxOptions): { userDir: string; roots: Root[] } {
@@ -44,6 +51,7 @@ export default Plugin.define({
   async setup(ctx) {
     const opts = (ctx.options ?? {}) as ScriptboxOptions;
     const { userDir, roots } = resolveRoots(opts);
+    const metricsOn = opts.metrics === true || opts.metrics === "verbose";
 
     await ctx.tool.transform((editor) => {
       editor.namespace({
@@ -124,10 +132,37 @@ export default Plugin.define({
         if (typeof args?.command !== "string") return;
         const catalog = scanRoots(roots);
         const hit = matchInvocation(args.command, catalog);
-        if (hit) recordUse(userDir, hit.entry, hit.name);
+        if (hit) recordUse(userDir, hit.entry, hit.name, metricsOn ? event.sessionID : undefined);
       } catch {
         // usage tracking never breaks the tool call
       }
     });
+
+    if (metricsOn) {
+      await ctx.tool.hook("execute.after", async (event) => {
+        try {
+          if (event.status !== "completed") return;
+          const tool =
+            event.tool === "scriptbox_save"
+              ? ("save" as const)
+              : event.tool === "scriptbox_list"
+                ? ("list" as const)
+                : event.tool === "scriptbox_show"
+                  ? ("show" as const)
+                  : null;
+          if (!tool) return;
+          if (tool === "save") {
+            // Validation failures complete with an error message; only
+            // count scripts that actually landed in the registry.
+            const content =
+              typeof event.result?.content === "string" ? event.result.content : "";
+            if (!content.includes(" saved to ")) return;
+          }
+          recordToolCall(userDir, event.sessionID, tool);
+        } catch {
+          // metrics never break the tool call
+        }
+      });
+    }
   },
 });

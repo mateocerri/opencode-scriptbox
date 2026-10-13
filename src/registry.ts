@@ -41,10 +41,69 @@ export interface ScanResult {
 }
 
 export const USAGE_NAME = "usage.json";
+export const MAX_SESSIONS = 20;
+
+export interface ScriptStats {
+  uses: number;
+  lastUsed: string;
+}
+
+export interface SessionStats {
+  lastSeen: string;
+  saves: number;
+  lists: number;
+  shows: number;
+  /** Shell invocations matched to a registry script. */
+  matches: number;
+}
+
+export interface UsageTotals {
+  saves: number;
+  lists: number;
+  shows: number;
+  matches: number;
+  uses: number;
+}
 
 interface UsageFile {
-  version: 1;
-  used: Record<string, string>;
+  version: 2;
+  scripts: Record<string, ScriptStats>;
+  sessions: Record<string, SessionStats>;
+  totals: UsageTotals;
+}
+
+function zeroSession(now: string): SessionStats {
+  return { lastSeen: now, saves: 0, lists: 0, shows: 0, matches: 0 };
+}
+
+function defaultUsage(): UsageFile {
+  return {
+    version: 2,
+    scripts: {},
+    sessions: {},
+    totals: { saves: 0, lists: 0, shows: 0, matches: 0, uses: 0 },
+  };
+}
+
+function evictSessions(usage: UsageFile): void {
+  const ids = Object.keys(usage.sessions).sort((a, b) =>
+    usage.sessions[a].lastSeen.localeCompare(usage.sessions[b].lastSeen),
+  );
+  for (const id of ids.slice(0, Math.max(0, ids.length - MAX_SESSIONS))) {
+    delete usage.sessions[id];
+  }
+}
+
+function writeUsage(userDir: string, usage: UsageFile): boolean {
+  try {
+    mkdirSync(userDir, { recursive: true });
+    const tmp = join(userDir, `.${USAGE_NAME}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(usage, null, 2) + "\n", "utf8");
+    renameSync(tmp, join(userDir, USAGE_NAME));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Scan one directory; invalid files stay invisible (closed world). */
@@ -128,11 +187,33 @@ export function saveScript(
 
 function loadUsage(userDir: string): UsageFile {
   try {
-    const parsed = JSON.parse(readFileSync(join(userDir, USAGE_NAME), "utf8")) as UsageFile;
-    if (parsed?.version !== 1 || typeof parsed.used !== "object") throw new Error("bad");
-    return parsed;
+    const parsed = JSON.parse(readFileSync(join(userDir, USAGE_NAME), "utf8")) as
+      | UsageFile
+      | { version: 1; used: Record<string, string> };
+    if (parsed?.version === 2 && typeof parsed === "object") {
+      const v2 = parsed as UsageFile;
+      if (
+        typeof v2.scripts === "object" &&
+        typeof v2.sessions === "object" &&
+        typeof v2.totals === "object"
+      ) {
+        return v2;
+      }
+      throw new Error("bad shape");
+    }
+    // v1 migration: stamps become single-use entries.
+    if (parsed?.version === 1 && typeof (parsed as { used?: unknown }).used === "object") {
+      const usage = defaultUsage();
+      for (const [key, stamp] of Object.entries(
+        (parsed as { used: Record<string, string> }).used,
+      )) {
+        if (typeof stamp === "string") usage.scripts[key] = { uses: 1, lastUsed: stamp };
+      }
+      return usage;
+    }
+    throw new Error("bad version");
   } catch {
-    return { version: 1, used: {} };
+    return defaultUsage();
   }
 }
 
@@ -140,13 +221,60 @@ function usageKey(entry: Entry, name: string): string {
   return `${entry.origin}:${name}`;
 }
 
-/** Best-effort usage stamp. Never throws. */
-export function recordUse(userDir: string, entry: Entry, name: string): boolean {
+/**
+ * Best-effort usage stamp. Without a session id it keeps the legacy
+ * behavior (lastUsed only). With one it also bumps the per-script use
+ * counter and the session's match bucket. Never throws.
+ */
+export function recordUse(
+  userDir: string,
+  entry: Entry,
+  name: string,
+  sessionID?: string,
+  now = new Date().toISOString(),
+): boolean {
   try {
     const usage = loadUsage(userDir);
-    usage.used[usageKey(entry, name)] = new Date().toISOString();
-    writeFileSync(join(userDir, USAGE_NAME), JSON.stringify(usage, null, 2) + "\n", "utf8");
-    return true;
+    const key = usageKey(entry, name);
+    const stats = usage.scripts[key] ?? { uses: 0, lastUsed: now };
+    stats.lastUsed = now;
+    usage.scripts[key] = stats;
+    if (typeof sessionID === "string" && sessionID) {
+      stats.uses += 1;
+      usage.totals.uses += 1;
+      const session = usage.sessions[sessionID] ?? zeroSession(now);
+      session.lastSeen = now;
+      session.matches += 1;
+      usage.sessions[sessionID] = session;
+      usage.totals.matches += 1;
+      evictSessions(usage);
+    }
+    return writeUsage(userDir, usage);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Count a registry tool call (save/list/show) in the session bucket and
+ * totals. Only wired when the `metrics` option is on. Never throws.
+ */
+export function recordToolCall(
+  userDir: string,
+  sessionID: string,
+  tool: "save" | "list" | "show",
+  now = new Date().toISOString(),
+): boolean {
+  try {
+    if (!sessionID || typeof sessionID !== "string") return false;
+    const usage = loadUsage(userDir);
+    const session = usage.sessions[sessionID] ?? zeroSession(now);
+    session.lastSeen = now;
+    session[`${tool}s` as "saves" | "lists" | "shows"] += 1;
+    usage.sessions[sessionID] = session;
+    usage.totals[`${tool}s` as "saves" | "lists" | "shows"] += 1;
+    evictSessions(usage);
+    return writeUsage(userDir, usage);
   } catch {
     return false;
   }
@@ -154,9 +282,18 @@ export function recordUse(userDir: string, entry: Entry, name: string): boolean 
 
 export function lastUsed(userDir: string, entry: Entry, name: string): string | null {
   try {
-    return loadUsage(userDir).used[usageKey(entry, name)] ?? null;
+    return loadUsage(userDir).scripts[usageKey(entry, name)]?.lastUsed ?? null;
   } catch {
     return null;
+  }
+}
+
+/** Read-only snapshot of the metrics (empty store when metrics are off). */
+export function readMetrics(userDir: string): UsageFile {
+  try {
+    return loadUsage(userDir);
+  } catch {
+    return defaultUsage();
   }
 }
 
