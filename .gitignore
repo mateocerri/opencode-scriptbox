@@ -1,1 +1,4 @@
 node_modules/
+
+# Engram local memory (syncs via Syncthing, never committed).
+.engram/
